@@ -1,0 +1,99 @@
+name: TEMP Sepehr Catalog Extract
+
+on:
+  push:
+    branches:
+      - temp-sepehr-catalog-extract-20261006
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: temp-sepehr-catalog-extract-20261006
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: pip install --disable-pip-version-check requests wasmtime
+      - name: Decode catalog manifest
+        shell: python
+        run: |
+          import base64, json, re, requests
+          from pathlib import Path
+          from wasmtime import Linker, Module, Store, WasmtimeError
+          CONFIG_URL="https://online.fliphtml5.com/xpgkv/ojuz/javascript/config.js"
+          DESTRING_URL="https://static.fliphtml5.com/resourceFiles/html5_templates/js/deString.js"
+          BASE="https://online.fliphtml5.com/xpgkv/ojuz/"
+          PS=65536
+          c=requests.get(CONFIG_URL,timeout=60); c.raise_for_status()
+          m=re.search(r"htmlConfig\s*=\s*({[\s\S]*?});",c.text)
+          if not m: raise RuntimeError("htmlConfig not found")
+          cfg=json.loads(m.group(1)); raw=cfg["fliphtml5_pages"]
+          j=requests.get(DESTRING_URL,timeout=60); j.raise_for_status()
+          wm=re.search(r"data:application/octet-stream;base64,([A-Za-z0-9+/=]+)",j.text)
+          if not wm: raise RuntimeError("WASM not found")
+          wasm=base64.b64decode(wm.group(1))
+          store=Store(); module=Module(store.engine,wasm); linker=Linker(store.engine)
+          def it(mod,mn,n):
+              for imp in mod.imports:
+                  if imp.module==mn and imp.name==n:return imp.type
+              raise RuntimeError("missing "+mn+"."+n)
+          def cm(c):
+              mm=c.get("memory")
+              if mm is None: raise RuntimeError("no memory")
+              return mm
+          def run(c,p): return None
+          def cp(c,d,s,z):
+              if z>0:
+                  mm=cm(c); mm.write(c,bytes(mm.read(c,s,s+z)),d)
+          def fd(c,fd,iovs,n,nw):
+              mm=cm(c); total=0
+              for i in range(n):
+                  b=iovs+i*8
+                  total+=int.from_bytes(mm.read(c,b+4,b+8),"little")
+              mm.write(c,total.to_bytes(4,"little"),nw); return 0
+          def grow(c,want):
+              mm=cm(c); cur=mm.data_len(c)
+              if want<=cur:return 1
+              try:mm.grow(c,(want-cur+PS-1)//PS);return 1
+              except WasmtimeError:return 0
+          linker.define_func("env","emscripten_run_script",it(module,"env","emscripten_run_script"),run,access_caller=True)
+          linker.define_func("env","emscripten_memcpy_big",it(module,"env","emscripten_memcpy_big"),cp,access_caller=True)
+          linker.define_func("wasi_snapshot_preview1","fd_write",it(module,"wasi_snapshot_preview1","fd_write"),fd,access_caller=True)
+          linker.define_func("env","emscripten_resize_heap",it(module,"env","emscripten_resize_heap"),grow,access_caller=True)
+          ins=linker.instantiate(store,module); ex=ins.exports(store)
+          ex["emscripten_stack_init"](store); ex["__wasm_call_ctors"](store)
+          mem=ex["memory"]; malloc=ex["malloc"]; free=ex["free"]; des=ex["DeString"]
+          inp=raw.encode()+b"\x00"; ip=malloc(store,len(inp)); mem.write(store,inp,ip)
+          op=des(store,ip); buf=bytes(mem.read(store,op,mem.data_len(store)))
+          n=buf.find(b"\x00"); buf=buf[:n] if n>=0 else buf
+          txt=buf.decode("utf-8",errors="replace"); free(store,ip)
+          a,b=txt.find("["),txt.rfind("]")
+          pages=json.loads(txt[a:b+1])
+          def iu(p):
+              rel=p["n"][0].replace("\\","/").replace("files/large/","").replace("./","")
+              if "files/content-page" in rel:return BASE+rel
+              if rel.lower().endswith(".zip"):return BASE+"files/content-page/"+rel
+              return BASE+"files/large/"+rel
+          rows=[{"page":i,"image_url":iu(p),"raw":p} for i,p in enumerate(pages,1)]
+          selected_pages=list(range(16,101))+list(range(104,121))+list(range(149,161))+list(range(187,205))+list(range(307,322))
+          out=Path("tmp_catalog_extract");out.mkdir(exist_ok=True)
+          (out/"all_pages.json").write_text(json.dumps(rows,ensure_ascii=False,indent=2))
+          (out/"selected_pages.json").write_text(json.dumps([r for r in rows if r["page"] in selected_pages],ensure_ascii=False,indent=2))
+          (out/"meta.json").write_text(json.dumps({"title":cfg.get("meta",{}).get("title"),"pageCount":len(rows),"pageWidth":cfg.get("meta",{}).get("pageWidth"),"pageHeight":cfg.get("meta",{}).get("pageHeight")},ensure_ascii=False,indent=2))
+          print("decoded",len(rows));print("p16",rows[15]["image_url"]);print("p17",rows[16]["image_url"])
+      - name: Commit manifest
+        run: |
+          git config user.name "sepehr-catalog-extractor"
+          git config user.email "actions@users.noreply.github.com"
+          git add tmp_catalog_extract
+          git commit -m "temp: decoded Sepehr catalog manifest" || exit 0
+          git push origin HEAD:temp-sepehr-catalog-extract-20261006
