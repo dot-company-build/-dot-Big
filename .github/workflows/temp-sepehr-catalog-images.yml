@@ -1,0 +1,47 @@
+name: TEMP Sepehr Catalog Images
+
+on:
+  push:
+    branches:
+      - temp-sepehr-catalog-extract-20261006
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: temp-sepehr-catalog-extract-20261006
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download selected original catalog pages
+        run: |
+          python - <<'PY'
+          import json, urllib.request
+          from pathlib import Path
+          rows=json.loads(Path("tmp_catalog_extract/selected_pages.json").read_text())
+          out=Path("sepehr_catalog_selected_pages")
+          out.mkdir(exist_ok=True)
+          headers={"User-Agent":"Mozilla/5.0","Referer":"https://online.fliphtml5.com/xpgkv/ojuz/"}
+          for r in rows:
+              page=r["page"]; url=r["image_url"]
+              ext=Path(url).suffix or ".webp"
+              dst=out/f"page_{page:03d}{ext}"
+              req=urllib.request.Request(url,headers=headers)
+              with urllib.request.urlopen(req,timeout=60) as resp:
+                  dst.write_bytes(resp.read())
+              print(page,dst.stat().st_size)
+          PY
+      - name: Upload catalog pages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sepehr-catalog-selected-pages
+          path: sepehr_catalog_selected_pages/
+          compression-level: 6
+          retention-days: 1
